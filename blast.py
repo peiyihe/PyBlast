@@ -1,87 +1,112 @@
-
-import re
-import numpy as np
 from collections import Counter
-from math import ceil
-from math import floor
+from pathlib import Path
 
-# Global variables
+import numpy as np
+
+from build_library import WORD_LENGTH, read_fasta
+
+
+# Global variables initialized by init_blast().
 chr_names = None
 chrom_seek_index = None
 fasta_file = None
 fasta_line_width = None
+reference_sequences = None
+library_seeks = None
+library_path = None
+
 
 def init_blast(data_dir='dataset'):
-    """Initialize global variables required for BLAST"""
+    """Load reference sequences and memory-map the seed index once."""
     global chr_names, chrom_seek_index, fasta_file, fasta_line_width
-    chr_names = np.load(f'{data_dir}/sarscov2_chr_names.npy')
-    chrom_seek_index = np.load(f'{data_dir}/sarscov2_chrom_seek_index.npy')
-    fasta_file = open(f"{data_dir}/sarscov2.fasta")
-    
-    # Auto-detect FASTA sequence line width
-    # Read first sequence line (skip header line starting with '>')
-    current_pos = fasta_file.tell()
+    global reference_sequences, library_seeks, library_path
+    data_dir = Path(data_dir)
+    records = read_fasta(data_dir / 'sarscov2.fasta')
+    names = np.load(data_dir / 'sarscov2_chr_names.npy')
+    chrom_index = np.load(data_dir / 'sarscov2_chrom_seek_index.npy')
+    seeks = np.load(data_dir / 'sarscov2_library_seeks.npy', mmap_mode='r')
+    if seeks.ndim == 2:
+        seeks = seeks[np.newaxis, :, :]
+    expected_chrom_index = np.array(
+        [(len(sequence), offset) for _, sequence, offset in records])
+    if (names.tolist() != [name for name, _, _ in records]
+            or not np.array_equal(chrom_index, expected_chrom_index)
+            or seeks.shape != (len(records), 4 ** WORD_LENGTH, 2)):
+        raise ValueError('Reference indexes do not match the FASTA. Rebuild with build_libraries(data_dir).')
+    new_library_path = data_dir / 'sarscov2.txt'
+    if not new_library_path.is_file():
+        raise FileNotFoundError(new_library_path)
+    new_fasta_file = open(data_dir / 'sarscov2.fasta')
+    if fasta_file is not None:
+        fasta_file.close()
+    chr_names, chrom_seek_index = names, chrom_index
+    reference_sequences = [sequence for _, sequence, _ in records]
+    library_seeks, library_path = seeks, new_library_path
+    fasta_file = new_fasta_file
+    fasta_file.readline()
+    fasta_line_width = len(fasta_file.readline().strip())
     fasta_file.seek(0)
-    line = fasta_file.readline()  # Skip header line
-    line = fasta_file.readline()  # Read first sequence line
-    fasta_line_width = len(line.rstrip('\n\r'))  # Get line width without newline
-    fasta_file.seek(current_pos)  # Restore original position
-    
     print(f"BLAST initialization complete! Loaded {len(chr_names)} sequence(s).")
-    print(f"Detected FASTA sequence line width: {fasta_line_width} characters.")
     return chr_names, chrom_seek_index, fasta_file
 
-# compare single base
-def SingleBaseCompare(seq1,seq2,i,j):
-    if seq1[i] == seq2[j]:
-        return 2
-    else:
-        return -1
-    
-# Smith–Waterman Alignment 
-def SMalignment(seq1, seq2):
-    m = len(seq1)
-    n = len(seq2)
-    g = -3
-    matrix = []
-    for i in range(0, m):
-        tmp = []
-        for j in range(0, n):
-            tmp.append(0)
-        matrix.append(tmp)
-    for sii in range(0, m):
-        matrix[sii][0] = sii*g
-    for sjj in range(0, n):
-        matrix[0][sjj] = sjj*g
-    for siii in range(1, m):
-        for sjjj in range(1, n):
-            matrix[siii][sjjj] = max(matrix[siii-1][sjjj] + g, matrix[siii - 1][sjjj - 1] + SingleBaseCompare(seq1,seq2,siii, sjjj), matrix[siii][sjjj-1] + g)
-    sequ1 = [seq1[m-1]]
-    sequ2 = [seq2[n-1]]
-    while m > 1 and n > 1:
-        if max(matrix[m-1][n-2], matrix[m-2][n-2], matrix[m-2][n-1]) == matrix[m-2][n-2]:
-            m -= 1
-            n -= 1
-            sequ1.append(seq1[m-1])
-            sequ2.append(seq2[n-1])
-        elif max(matrix[m-1][n-2], matrix[m-2][n-2], matrix[m-2][n-1]) == matrix[m-1][n-2]:
-            n -= 1
-            sequ1.append('-')
-            sequ2.append(seq2[n-1])
+
+def _require_initialized():
+    if reference_sequences is None:
+        raise RuntimeError('Call init_blast() before querying the reference.')
+
+
+def SingleBaseCompare(seq1, seq2, i, j):
+    # Ambiguous bases are mismatches, even when the symbols are identical.
+    return 2 if seq1[i] == seq2[j] and seq1[i] in 'ACGT' else -1
+
+
+def _local_alignment(seq1, seq2):
+    """Smith-Waterman with +2 match, -1 mismatch, and -3 linear gap cost.
+
+    Return aligned strings, identity, and zero-based half-open intervals.
+    """
+    seq1, seq2 = seq1.upper(), seq2.upper()
+    m, n = len(seq1), len(seq2)
+    matrix = [[0] * (n + 1) for _ in range(m + 1)]
+    best_score, end_i, end_j = 0, 0, 0
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            matrix[i][j] = max(
+                0,
+                matrix[i - 1][j - 1] + SingleBaseCompare(seq1, seq2, i - 1, j - 1),
+                matrix[i - 1][j] - 3,
+                matrix[i][j - 1] - 3,
+            )
+            if matrix[i][j] > best_score:
+                best_score, end_i, end_j = matrix[i][j], i, j
+
+    i, j = end_i, end_j
+    aligned1, aligned2 = [], []
+    while i > 0 and j > 0 and matrix[i][j] > 0:
+        # Follow a transition that produced this cell, including its cost.
+        if matrix[i][j] == matrix[i - 1][j - 1] + SingleBaseCompare(seq1, seq2, i - 1, j - 1):
+            aligned1.append(seq1[i - 1])
+            aligned2.append(seq2[j - 1])
+            i, j = i - 1, j - 1
+        elif matrix[i][j] == matrix[i - 1][j] - 3:
+            aligned1.append(seq1[i - 1])
+            aligned2.append('-')
+            i -= 1
         else:
-            m -= 1
-            sequ1.append(seq1[m-1])
-            sequ2.append('-')
-    sequ1.reverse()
-    sequ2.reverse()
-    align_seq1 = ''.join(sequ1)
-    align_seq2 = ''.join(sequ2)
-    align_score = 0.
-    for k in range(0, len(align_seq1)):
-        if align_seq1[k] == align_seq2[k]:
-            align_score += 1
-    align_score = float(align_score)/len(align_seq1)
-    return align_seq1, align_seq2, align_score
+            aligned1.append('-')
+            aligned2.append(seq2[j - 1])
+            j -= 1
+    align_seq1 = ''.join(reversed(aligned1))
+    align_seq2 = ''.join(reversed(aligned2))
+    matches = sum(a == b and a in 'ACGT' for a, b in zip(align_seq1, align_seq2))
+    identity = matches / len(align_seq1) if align_seq1 else 0.0
+    return align_seq1, align_seq2, identity, i, end_i, j, end_j
+
+
+def SMalignment(seq1, seq2):
+    """Return a local alignment and its identity fraction (0 to 1)."""
+    return _local_alignment(seq1, seq2)[:3]
+
 
 # Display BlAST result
 def Display(seque1, seque2):
@@ -94,7 +119,7 @@ def Display(seque1, seque2):
         print("\n")
         print('           ',end='')
         for k in range(le-40, le):
-            if seque1[k] == seque2[k]:
+            if seque1[k] == seque2[k] and seque1[k] in 'ACGT':
                 print('|',end='')
             else:
                 print(' ',end='')
@@ -111,7 +136,7 @@ def Display(seque1, seque2):
         print("\n")
         print('           ',end='')
         for k in range(le-40, len(seque1)):
-            if seque1[k] == seque2[k]:
+            if seque1[k] == seque2[k] and seque1[k] in 'ACGT':
                 print('|',end='')
             else:
                 print(' ',end='')
@@ -121,109 +146,96 @@ def Display(seque1, seque2):
             print(b,end='')
         print("\n")
 
-# transform base to numeric value
+# Transform a canonical DNA word to its base-4 index.
 def WordToNum(word):
-    tmp = []
-    trans = {'A':1,'C':2,'G':3,'T':4}
-    for w in word:
-        tmp.append(trans[w])
-    return tmp
+    trans = {'A': 1, 'C': 2, 'G': 3, 'T': 4}
+    return [trans[base] for base in word.upper()]
 
-# transform word with 11 bases to its index
-def WordToIndex(word,word_len):
-    tmp = 0
-    word_num = WordToNum(word)
-    for i,v in enumerate(word_num):
-        tmp += (v-1)*4**(word_len-i)
-    return tmp   
 
-# Get word's postion in genome from library
+def WordToIndex(word, word_len):
+    return sum((value - 1) * 4 ** (word_len - i)
+               for i, value in enumerate(WordToNum(word)))
+
+
 def GetWordPos(word):
-    assert len(word)== 11
-    seek_index = WordToIndex(word,11-1)
+    """Return one list of one-based seed positions per reference."""
+    _require_initialized()
+    word = word.upper()
+    if len(word) != WORD_LENGTH:
+        raise ValueError(f'Seed words must contain {WORD_LENGTH} bases.')
+    if not set(word) <= set('ACGT'):
+        return [[] for _ in chr_names]
+    seek_index = WordToIndex(word, WORD_LENGTH - 1)
     positions = []
-    # Only need to open file once and load index once (for single sequence)
-    with open('dataset/sarscov2.txt','r') as chr_seq:
-        seeks = np.load("dataset/sarscov2_library_seeks.npy")
-        chr_seq.seek(seeks[seek_index,0])
-        position = chr_seq.read(seeks[seek_index,1])
-        try:
-            positions.append(list(map(int, position[:-1].split(","))))
-        except:
-            positions.append([])
+    with open(library_path, 'rb') as handle:
+        for seeks in library_seeks:
+            offset, length = map(int, seeks[seek_index])
+            handle.seek(offset)
+            entry = handle.read(length).decode('ascii').rstrip(',')
+            positions.append([int(value) for value in entry.split(',')] if entry else [])
     return positions
 
-# Extract subsequence from fasta file
-def ExtractSeq(chr_index,pos,length):
-    # Auto-calculate position adjustment based on detected line width
-    # Each line has fasta_line_width characters, so we need to add one newline per line
-    pos = pos+floor(pos/fasta_line_width)
-    fasta_file.seek(chrom_seek_index[chr_index,1]+pos-1)
-    return re.sub(r'\n', '', fasta_file.read(length))
 
-# main blast function
+def ExtractSeq(chr_index, pos, length):
+    """Extract bases using a one-based start, clipping at the reference end."""
+    _require_initialized()
+    if not 0 <= chr_index < len(reference_sequences):
+        raise IndexError('Reference index out of range.')
+    if pos < 1 or length < 0:
+        raise ValueError('Sequence position must be >= 1 and length must be >= 0.')
+    # Slice normalized bases, so newlines never consume requested length.
+    return reference_sequences[chr_index][pos - 1:pos - 1 + length]
+
+
 def Blast(query_seq):
-    i = 0
-    query_words = []
-    query_seq_length = len(query_seq)
-    words_length = query_seq_length-11+1
-    while i < words_length:
-        query_words.append(query_seq[i:i+11])
-        i += 1
+    _require_initialized()
+    query_seq = ''.join(query_seq.split()).upper()
+    if len(query_seq) < WORD_LENGTH:
+        raise ValueError(f'Query must contain at least {WORD_LENGTH} bases.')
+    if not set(query_seq) <= set('ACGTRYSWKMBDHVN'):
+        raise ValueError('Query must contain DNA IUPAC bases only.')
+
     words_positions = []
-    for word in query_words:
-        words_positions.append(GetWordPos(word))
-    # Dynamically iterate through all sequences
-    for chr_index in range(len(chr_names)):
-        for word_index in range(words_length):
-            for pos in range(len(words_positions[word_index][chr_index])):
-                words_positions[word_index][chr_index][pos] += words_length - word_index - 1
-        
-        words_positions_corrects = []
-        for word_index in range(words_length):
-            words_positions_corrects += words_positions[word_index][chr_index]
-        
-        words_positions_corrects_count = Counter(words_positions_corrects)
-        
-        # Debug info: display matching statistics
-        # if words_positions_corrects_count:
-        #     top_matches = words_positions_corrects_count.most_common(5)
-        #     print(f"Top 5 matching positions found in sequence {chr_names[chr_index]}:")
-        #     for pos, count in top_matches:
-        #         print(f"  Position {pos}: {count} 11-mer matches")
-        
-        finded_postions = []
-        for count_ in words_positions_corrects_count:
-            # we can select the bigger threshold of words_positions_corrects_count[count_] just 
-            # like we select the highly similar sequence in NCBI BLAST
-            if words_positions_corrects_count[count_] > 5:
-                finded_postions.append(count_)
-        
-        if not finded_postions and words_positions_corrects_count:
-            print(f"⚠️ Warning: Found matches but all below threshold (>5), max match count: {max(words_positions_corrects_count.values())}")
-        if finded_postions:
-            for finded_postion in finded_postions:
-                print("finded_postion: ", finded_postion)
-                candidate_seq_pos = finded_postion - query_seq_length + 11 - 5
-                candidate_seq_length = query_seq_length + 11
-                candidate_sequence = ExtractSeq(chr_index,candidate_seq_pos,candidate_seq_length)
-                i_start_indexs = []
-                for i_start in range(15):
-                    _,_,score = SMalignment(candidate_sequence[i_start:],query_seq)
-                    i_start_indexs.append(score)
-                i_start = np.array(i_start_indexs).argmax()
-                i_end_indexs = []
-                for i_end in range(1,16):
-                    _,_,score = SMalignment(candidate_sequence[:-i_end],query_seq)
-                    i_end_indexs.append(score)
-                i_end = np.array(i_end_indexs).argmax()+1
-                candidate_sequence = candidate_sequence[i_start:-i_end]
-                align_seq1,align_seq2,align_score = SMalignment(candidate_sequence,query_seq)
-                # print(align_seq1, align_seq2, align_score)
-                if align_score>0.8:
-                    print("find in chromosome "+chr_names[chr_index]+": "+str(candidate_seq_pos+i_start)+' ---> '+str(candidate_seq_pos+i_start+len(candidate_sequence)-1)+", align score: "+str(align_score))
-                    Display(align_seq1, align_seq2)
+    for word_index in range(len(query_seq) - WORD_LENGTH + 1):
+        word = query_seq[word_index:word_index + WORD_LENGTH]
+        if set(word) <= set('ACGT'):
+            words_positions.append((word_index, GetWordPos(word)))
+    # Retain the six-seed threshold for longer queries; allow 11-15 bases.
+    threshold = min(6, len(words_positions))
+    found = False
+    for chr_index, reference in enumerate(reference_sequences):
+        starts = Counter(
+            pos - word_index
+            for word_index, positions in words_positions
+            for pos in positions[chr_index]
+        )
+        reported = set()
+        for start, count in starts.items():
+            if count < threshold:
+                continue
+            # A small extension allows local alignment to recover nearby indels.
+            candidate_start = max(1, start - 5)
+            candidate_end = min(len(reference), start + len(query_seq) - 1 + 5)
+            candidate = ExtractSeq(chr_index, candidate_start,
+                                   max(0, candidate_end - candidate_start + 1))
+            aligned1, aligned2, identity, ref_start, ref_end, query_start, query_end = _local_alignment(candidate, query_seq)
+            coverage = (query_end - query_start) / len(query_seq)
+            # Identity alone would accept tiny local matches to a long query.
+            if identity <= 0.8 or coverage < 0.8:
+                continue
+            first = candidate_start + ref_start
+            last = candidate_start + ref_end - 1
+            key = (first, last, aligned1, aligned2)
+            if key in reported:
+                continue
+            reported.add(key)
+            found = True
+            print(f'find in chromosome {chr_names[chr_index]}: {first} ---> {last}, align score: {identity}')
+            Display(aligned1, aligned2)
+    if not found:
+        print('No alignments found (requires an exact 11-base seed).')
     return None
+
 
 if __name__ == "__main__":
     # Initialize BLAST

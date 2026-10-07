@@ -1,97 +1,111 @@
+from collections import defaultdict
+from pathlib import Path
+
 import numpy as np
-import re
-from math import ceil
+
+
+WORD_LENGTH = 11
+chrom_dict = {}
+
+
+def read_fasta(path):
+    """Return (name, sequence, byte offset) records, independent of line width."""
+    records = []
+    seen = set()
+    name = None
+    chunks = []
+    offset = 0
+    # Binary offsets account for CRLF and different wrapping in each record.
+    with open(path, 'rb') as handle:
+        for line in iter(handle.readline, b''):
+            if line.startswith(b'>'):
+                if name is not None:
+                    records.append((name, ''.join(chunks), offset))
+                header = line[1:].decode('utf-8').split()
+                if not header or header[0] in seen:
+                    raise ValueError('FASTA headers must have unique, nonempty names.')
+                name = header[0]
+                seen.add(name)
+                chunks = []
+                offset = handle.tell()
+            elif line.strip():
+                if name is None:
+                    raise ValueError('FASTA sequence encountered before its header.')
+                chunks.append(b''.join(line.split()).decode('ascii').upper())
+    if name is not None:
+        records.append((name, ''.join(chunks), offset))
+    if not records or any(not sequence for _, sequence, _ in records):
+        raise ValueError('FASTA must contain nonempty reference sequences.')
+    return records
+
 
 def BaseToNum(chr_seq):
-    chr_seq = re.sub(r'A', '1', chr_seq)
-    chr_seq = re.sub(r'C', '2', chr_seq)
-    chr_seq = re.sub(r'G', '3', chr_seq)
-    chr_seq = re.sub(r'T', '4', chr_seq)
-    return chr_seq
+    return chr_seq.upper().translate(str.maketrans('ACGT', '1234'))
 
-def BaseToIndex(word,word_len):
-    tmp = 0
-    for i,v in enumerate(word):
-        tmp += (int(v)-1)*4**(word_len-i)
-    return tmp    
 
-def GenSeek(library,word_len):
-    seeks = np.zeros((4**word_len,2),dtype=int)
-    tmp = 0
-    for i,l in enumerate(library):
-        seeks[i,0] = tmp
-        seeks[i,1] = len(l)
-        tmp += len(l)
+def BaseToIndex(word, word_len):
+    return sum((int(value) - 1) * 4 ** (word_len - i)
+               for i, value in enumerate(word))
+
+
+def GenSeek(library, word_len):
+    seeks = np.zeros((4 ** word_len, 2), dtype=np.int64)
+    offset = 0
+    for i, entry in enumerate(library):
+        seeks[i] = offset, len(entry)
+        offset += len(entry)
     return seeks
 
-def BuildLibrary(chr_name):
-    word_len = 11
-    chr_seq = chrom_dict[chr_name]
-    chr_seq = BaseToNum(chr_seq)
-    chr_len = len(chr_seq)
-    library = np.zeros(4**word_len,dtype=str).tolist()
-    ii = 0
-    while ii<chr_len-word_len:
-        w = chr_seq[ii:ii+word_len]
-        ii += 1
-        if 'N' in w:
-            continue
-        try:
-            library[BaseToIndex(w,word_len-1)] += str(ii)+","
-        except:
-            pass
-    
-    seeks = GenSeek(library,word_len)
-    lib_seq = ''.join(library)
-    with open('dataset/sarscov2.txt', 'w') as f:
-        f.write(lib_seq)
-        f.close()
-    np.save('dataset/sarscov2_library_seeks.npy',seeks)
-    
+
+def BuildLibrary(chr_name, data_dir='dataset', append=False):
+    """Write one reference's positions and return its absolute seek offsets."""
+    sequence = BaseToNum(chrom_dict[chr_name])
+    positions = defaultdict(list)
+    # Include the final word; stored sequence coordinates are one-based.
+    for start in range(len(sequence) - WORD_LENGTH + 1):
+        word = sequence[start:start + WORD_LENGTH]
+        if set(word) <= set('1234'):
+            positions[BaseToIndex(word, WORD_LENGTH - 1)].append(str(start + 1))
+
+    seeks = np.zeros((4 ** WORD_LENGTH, 2), dtype=np.int64)
+    with open(Path(data_dir) / 'sarscov2.txt', 'ab' if append else 'wb') as handle:
+        for index in sorted(positions):
+            entry = (','.join(positions[index]) + ',').encode('ascii')
+            seeks[index] = handle.tell(), len(entry)
+            handle.write(entry)
+    if not append:
+        np.save(Path(data_dir) / 'sarscov2_library_seeks.npy', seeks)
+    return seeks
+
+
+def build_libraries(data_dir='dataset'):
+    """Regenerate all indexes for sarscov2.fasta in the selected directory."""
+    global chrom_dict
+    data_dir = Path(data_dir)
+    records = read_fasta(data_dir / 'sarscov2.fasta')
+    chrom_dict = {name: sequence for name, sequence, _ in records}
+    names = [name for name, _, _ in records]
+    np.save(data_dir / 'sarscov2_chr_names.npy', np.array(names))
+    np.save(data_dir / 'sarscov2_chrom_seek_index.npy',
+            np.array([(len(sequence), offset) for _, sequence, offset in records],
+                     dtype=np.int64))
+
+    print('Starting to build index library...')
+    for i, name in enumerate(names):
+        print(f'Processing: {name}')
+        seeks = BuildLibrary(name, data_dir, append=i > 0)
+        if i == 0 and len(names) > 1:
+            # Keep the original 2-D format for single-reference databases.
+            all_seeks = np.lib.format.open_memmap(
+                data_dir / 'sarscov2_library_seeks.npy', mode='w+',
+                dtype=np.int64, shape=(len(names), 4 ** WORD_LENGTH, 2))
+        if len(names) > 1:
+            all_seeks[i] = seeks
+    if len(names) > 1:
+        all_seeks.flush()
+        del all_seeks
+    print('Index library construction completed!')
+
 
 if __name__ == '__main__':
-    hg19 = open("dataset/sarscov2.fasta")
-    head = True
-    chrom_dict = {}
-    head_line = []
-    chr_names = []
-    for line in hg19:
-        if line.startswith(">"):
-            head_line.append(line)
-            if head:
-                head = False
-            else:
-                chr_seq = re.sub(r'\n', '', chr_seq)
-                chr_seq = chr_seq.upper()
-                chrom_dict[chr_name] = chr_seq
-            chr_name = line.split()[0][1:]
-            chr_names.append(chr_name)
-            chr_seq = ''
-            print(chr_name,end=",")
-        else:
-            chr_seq += line
-    chr_seq = re.sub(r'\n', '', chr_seq)
-    chr_seq = chr_seq.upper()
-    chrom_dict[chr_name] = chr_seq
-    
-    # Build index based on actual sequence length (not parsed from header)
-    chrom_seek_index = []
-    for i, (chr_name_item, line) in enumerate(zip(chr_names, head_line)):
-        seq_length = len(chrom_dict[chr_name_item])
-        header_length = len(line)
-        chrom_seek_index.append([seq_length, header_length])
-    chrom_seek_index = np.array(chrom_seek_index)
-    
-    # Dynamically process index for multiple sequences
-    for i in range(1, len(head_line)):
-        chrom_seek_index[i,1]=chrom_seek_index[i,1]+chrom_seek_index[i-1,1]+chrom_seek_index[i-1,0]+ceil(chrom_seek_index[i-1,0]/70)
-    np.save('dataset/sarscov2_chrom_seek_index.npy',chrom_seek_index)
-    np.save('dataset/sarscov2_chr_names.npy',np.array(chr_names))
-    print(chr_names)
-    
-    # For single sequence, process directly in loop (no multiprocessing needed)
-    print("\nStarting to build index library...")
-    for chr_name in chr_names:
-        print(f"Processing: {chr_name}")
-        BuildLibrary(chr_name)
-    print("Index library construction completed!")
+    build_libraries()
